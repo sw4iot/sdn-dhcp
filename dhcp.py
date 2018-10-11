@@ -32,6 +32,7 @@ from ryu.lib.packet import ipv4
 from ryu.lib.packet import packet
 from ryu.lib.packet import udp
 from ryu.ofproto import ofproto_v1_3
+from ryu.ofproto import ether
 from webob import Response
 
 from netaddr import IPNetwork, IPAddress
@@ -200,7 +201,7 @@ class DHCPResponder(app_manager.RyuApp):
         
         if pkt_dhcp:
             if datapath.id in self.switches:
-                self._handle_dhcp(datapath, port, pkt)
+                self._handle_dhcp(datapath, port, pkt, msg.buffer_id)
 
     def assemble_ack(self, pkt, datapath):
         req_eth = pkt.get_protocol(ethernet.ethernet)
@@ -243,7 +244,6 @@ class DHCPResponder(app_manager.RyuApp):
                                            options=req.options))
             self.logger.info("ASSEMBLED ACK: %s -> %s" %
                              (req_eth.src, hostipaddress))
-        print "PKT ACK", ack_pkt
         return ack_pkt
 
     def assemble_offer(self, pkt, datapath):
@@ -289,7 +289,7 @@ class DHCPResponder(app_manager.RyuApp):
 
             self.logger.info("ASSEMBLED OFFER: %s --> %s" %
                              (disc_eth.src, hostipaddress))
-        #print offer_pkt
+
         return offer_pkt
 
     def get_state(self, pkt_dhcp):
@@ -305,7 +305,25 @@ class DHCPResponder(app_manager.RyuApp):
             state = 'DHCPACK'
         return state
 
-    def _handle_dhcp(self, datapath, port, pkt):
+    def add_flow(self, datapath, priority, table_id, match, actions, buffer_id=None):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                             actions)]
+        
+        if buffer_id:
+            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
+                                    priority=priority, match=match,
+                                    table_id=table_id,
+                                    instructions=inst)
+        else:
+            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                    match=match, table_id=table_id,
+                                    instructions=inst)
+        datapath.send_msg(mod)
+    
+    def _handle_dhcp(self, datapath, port, pkt, buffer_id):
 
         pkt_dhcp = pkt.get_protocols(dhcp.dhcp)[0]
         dhcp_state = self.get_state(pkt_dhcp)
@@ -319,13 +337,48 @@ class DHCPResponder(app_manager.RyuApp):
         elif dhcp_state == 'DHCPREQUEST':
             ack = self.assemble_ack(pkt, datapath.id)
             if ack:
+                self.pod_contiv_info = {'ipaddress': '30.1.1.8',
+                                     'port': 2}
+                                     
+                self._add_flow_to_table(datapath, buffer_id, port, pkt)
                 self._send_packet(datapath, port, ack)
 
+    def _add_flow_to_table(self, datapath, buffer_id, in_port, pkt):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        pkt_ethernet = pkt.get_protocol(ethernet.ethernet)
+        pkt_ip = pkt.get_protocol(ipv4.ipv4)
+        
+        eth_dst = pkt_ethernet.dst
+        eth_src = pkt_ethernet.src
+        ipv4_src = pkt_ip.src
+        ipv4_dst = pkt_ip.dst
+
+        match = parser.OFPMatch(in_port=in_port,
+                                eth_type=ether.ETH_TYPE_IP,
+                                ipv4_dst=self.pod_contiv_info['ipaddress'])
+                                
+        actions = [parser.OFPActionOutput(self.pod_contiv_info['port'])]
+        
+        match_back = parser.OFPMatch(in_port=self.pod_contiv_info['port'],
+                                     eth_type=ether.ETH_TYPE_IP,
+                                     ipv4_dst="30.1.1.7")
+
+        actions_back = [parser.OFPActionSetField(eth_dst=eth_src),
+                        parser.OFPActionOutput(in_port)]
+
+        # table contiv
+        self.add_flow(datapath, 1, 1, match, actions, buffer_id)
+
+        # table wifi
+        self.add_flow(datapath, 1, 2, match_back, actions_back, buffer_id)
+        
     def _send_packet(self, datapath, port, pkt):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         pkt.serialize()
-        #self.logger.info("packet-out %s" % (pkt,))
+        self.logger.info("packet-out %s" % (pkt,))
         data = pkt.data
         actions = [parser.OFPActionOutput(port=port)]
         out = parser.OFPPacketOut(datapath=datapath,
